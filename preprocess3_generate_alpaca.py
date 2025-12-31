@@ -182,7 +182,8 @@ def process_dataset(input_file, output_file, col_cached, col_archived):
                 stats["errors"] += 1
             else:
                 # 评分减1逻辑
-                should_drop, modified_doc = apply_score_reduction(archived_doc)
+                # should_drop, modified_doc = apply_score_reduction(archived_doc)
+                should_drop, modified_doc = False, archived_doc
 
                 if should_drop:
                     target_output = format_json_output({"UUID": uuid})
