@@ -1,13 +1,32 @@
+from typing import Dict, Any, List
+
 import pymongo
 import json
 import os
 from tqdm import tqdm
 from bson import ObjectId
 from datetime import datetime, date
-from pydantic import ValidationError
+from pydantic import ValidationError, BaseModel
 
 from ServiceComponent.IntelligenceHubDefines import ProcessedData
-from ServiceComponent.IntelligenceAnalyzerProxy import build_analyze_user_message
+
+
+class AIMessage(BaseModel):
+    UUID: str
+    content: str
+    title: str | None = None
+    authors: List[str] = []
+    pub_time: object | None = None
+    informant: str | None = None
+
+
+def build_analyze_user_message(structured_data: Dict[str, Any]) -> str:
+    sanitized_data = AIMessage.model_validate(structured_data).model_dump(exclude_unset=True, exclude_none=True)
+    metadata_items = [f"- {k}: {v}" for k, v in sanitized_data.items() if k != "content"]
+    metadata_block = '## metadata\n' + "\n".join(metadata_items)
+    content_block = f"\n\n## 正文内容\n{sanitized_data['content']}"
+    user_message = metadata_block + content_block
+    return user_message
 
 # ================= 配置区域 =================
 
