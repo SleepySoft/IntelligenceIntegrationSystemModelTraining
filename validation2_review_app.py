@@ -5,7 +5,8 @@ import re
 import pandas as pd
 
 # ================= 配置 =================
-DATA_FILE = "Data/v1/result_ckpt100.jsonl"
+# DATA_FILE = "Data/v1/result_ckpt100.jsonl"
+DATA_FILE = "result_checkpoint-700.jsonl"
 REVIEWED_FILE = "eval_reviewed.jsonl"
 
 st.set_page_config(layout="wide", page_title="Model Evaluation Tool")

@@ -1,0 +1,10 @@
+pymongo
+pandas
+numpy
+scikit-learn
+tqdm
+pydantic
+torch
+transformers
+peft
+streamlit
