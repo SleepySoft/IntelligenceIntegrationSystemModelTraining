@@ -82,7 +82,7 @@ def main(adapter_path, base_model_path, test_data_path, output_file):
             # instruction = item.get("instruction", "")
             instruction = TRAIN_PROMPT              # 使用训练时的prompt
             input_text = item.get("input", "")
-            # ground_truth = item.get("output", "") # 推理时其实不需要 GT
+            ground_truth = item.get("output", "")
 
             # 【关键修改】DeepSeek-R1 模板适配
             # 很多 R1 Distill 模型不需要强制 System Prompt，或者依靠 tokenizer_config.json 自动处理
@@ -126,6 +126,7 @@ def main(adapter_path, base_model_path, test_data_path, output_file):
             result_entry = {
                 "instruction": instruction,
                 "input": input_text,
+                "ground_truth": ground_truth,
                 "model_output": response,
                 "adapter": adapter_path
             }
