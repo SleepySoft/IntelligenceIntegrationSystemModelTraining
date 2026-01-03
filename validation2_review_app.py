@@ -3,87 +3,34 @@ import json
 import os
 import re
 import pandas as pd
+from collections import Counter
 
 # ================= 配置 =================
 # DATA_FILE = "Data/v1/result_ckpt100.jsonl"
-DATA_FILE = "result_checkpoint-700.jsonl"
+DATA_FILE = "evaluation-20260103/result_ckpt360.jsonl"
 REVIEWED_FILE = "eval_reviewed.jsonl"
 
-st.set_page_config(layout="wide", page_title="Model Evaluation Tool")
+st.set_page_config(layout="wide", page_title="Model Evaluation Tool - Advanced")
 
 
-# streamlit run validation2_review_app.py
+# --- 1. 核心解析与评估逻辑 (Core Logic) ---
 
-
-# --- Helper Functions ---
-def load_data():
-    data = []
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            for line in f:
-                data.append(json.loads(line))
-    return data
-
-
-def save_progress(index, label, comment, current_data):
-    # 更新内存中的数据
-    current_data[index]['human_label'] = label
-    current_data[index]['comments'] = comment
-
-    # 追加/覆盖写入文件 (这里简单处理：每次全部重写，数据量不大时没问题)
-    # 实际生产中建议 Append 模式或数据库
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        for entry in current_data:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-
-def extract_primary_category(rate_data):
-    """
-    从 RATE 字典中提取除 [内容准确率, 规模及影响, 潜力及传承] 之外的最高分领域。
-    返回: (CategoryName, Score)
-    """
-    if not isinstance(rate_data, dict):
-        return "N/A", 0
-
-    # 1. 定义黑名单 (不需要参与比较的 key)
-    exclude_keys = {"内容准确率", "规模及影响", "潜力及传承"}
-
-    # 2. 筛选：只保留不在黑名单里的项
-    # candidates 格式: {'国家政策': 0, '社会事件': 3, ...}
-    candidates = {k: v for k, v in rate_data.items() if k not in exclude_keys}
-
-    if not candidates:
-        return "无有效领域", 0
-
-    # 3. 找出分数最高的 Key
-    # max(candidates, key=candidates.get) 会返回 value 最大的那个 key
-    best_category = max(candidates, key=candidates.get)
-    best_score = candidates[best_category]
-
-    return best_category, best_score
-
-
-# --- 1. 增强版 JSON 解析器 ---
 def safe_parse_json(text):
     """
     尝试解析 JSON，如果失败返回 None。
-    支持处理字典对象、标准 JSON 字符串、Markdown 代码块包裹的 JSON。
     """
     if text is None:
         return None
     if isinstance(text, dict):
         return text
 
-    # 如果是字符串，尝试解析
     text = str(text).strip()
-
-    # 情况 A: 已经是干净的 JSON
     try:
         return json.loads(text)
     except:
         pass
 
-    # 情况 B: 被 ```json ... ``` 包裹
+    # 尝试提取 markdown json
     match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
     if match:
         try:
@@ -91,7 +38,7 @@ def safe_parse_json(text):
         except:
             pass
 
-    # 情况 C: 只有一部分是 JSON，尝试提取第一个 { 到最后一个 }
+    # 尝试提取第一个 {}
     match = re.search(r'(\{.*\})', text, re.DOTALL)
     if match:
         try:
@@ -99,57 +46,263 @@ def safe_parse_json(text):
         except:
             pass
 
-    # 解析失败
     return None
 
 
-# --- 2. 改进版渲染函数：出错时展示原文 ---
-def render_content_card(column, title, raw_data, style="default"):
+def is_negative_sample(data_dict):
     """
-    raw_data: 可能是字符串(模型输出)，也可能是字典(Ground Truth)
+    判断是否为负例（无价值情报）。
+    逻辑：如果是 None，视为错误（不是负例）。
+    如果 Key 只有 UUID，或者没有 RATE/EVENT_TEXT 字段，视为负例。
     """
-    # 尝试解析
+    if not data_dict or not isinstance(data_dict, dict):
+        return False
+
+    # 逻辑：只有 UUID 或 显式为空
+    keys = set(data_dict.keys())
+    if keys == {'UUID'}:
+        return True
+
+    # 或者没有核心内容字段
+    if 'RATE' not in data_dict and 'EVENT_TEXT' not in data_dict:
+        return True
+
+    return False
+
+
+def extract_scores(rate_data):
+    """
+    解析 RATE 字典。
+    返回:
+    1. independent_scores: { '内容准确率': val, '规模及影响': val, '潜力及传承': val }
+    2. primary_category: (Name, Score) - 除去上述三个key后的最高分项
+    """
+    if not isinstance(rate_data, dict):
+        return {}, ("N/A", 0)
+
+    independent_keys = {"内容准确率", "规模及影响", "潜力及传承"}
+
+    # 提取独立分数
+    independent_scores = {k: rate_data.get(k, 0) for k in independent_keys}
+
+    # 提取主要维度
+    candidates = {k: v for k, v in rate_data.items() if k not in independent_keys}
+
+    if not candidates:
+        return independent_scores, ("无有效领域", 0)
+
+    best_category = max(candidates, key=candidates.get)
+    best_score = candidates[best_category]
+
+    return independent_scores, (best_category, best_score)
+
+
+def evaluate_single_sample(gt_raw, pred_raw):
+    """
+    对单条数据进行自动化评估，返回评估结果对象
+    """
+    gt = safe_parse_json(gt_raw)
+    pred = safe_parse_json(pred_raw)
+
+    result = {
+        "format_error": False,
+        "uuid_missing": False,
+        "classification": "Unknown",  # TP, TN, FP, FN
+        "dim_match": None,  # 主要维度是否一致
+        "score_deltas": {},  # 独立评分偏差
+        "details": ""
+    }
+
+    # 1. 检查格式错误
+    if pred is None:
+        result["format_error"] = True
+        return result
+
+    if "UUID" not in pred:
+        result["uuid_missing"] = True
+        result["format_error"] = True  # 视作格式错误
+        return result
+
+    # 2. 检查正负例
+    gt_is_neg = is_negative_sample(gt)
+    pred_is_neg = is_negative_sample(pred)
+
+    if not gt_is_neg and not pred_is_neg:
+        result["classification"] = "TP"  # 都有内容
+    elif gt_is_neg and pred_is_neg:
+        result["classification"] = "TN"  # 都认为没内容
+    elif gt_is_neg and not pred_is_neg:
+        result["classification"] = "FP"  # GT无内容，模型编造了内容
+    elif not gt_is_neg and pred_is_neg:
+        result["classification"] = "FN"  # GT有内容，模型忽略了
+
+    # 3. 如果是 TP (两者都有内容)，深入对比维度和分数
+    if result["classification"] == "TP":
+        gt_indep, (gt_cat, _) = extract_scores(gt.get("RATE", {}))
+        pred_indep, (pred_cat, _) = extract_scores(pred.get("RATE", {}))
+
+        # 维度对比
+        result["dim_match"] = (gt_cat == pred_cat)
+        result["gt_primary"] = gt_cat
+        result["pred_primary"] = pred_cat
+
+        # 分数对比 (Pred - GT)
+        for k in gt_indep:
+            result["score_deltas"][k] = pred_indep.get(k, 0) - gt_indep[k]
+
+    return result
+
+
+def calculate_global_metrics(data_list):
+    """
+    遍历所有数据，计算全局指标
+    """
+    stats = {
+        "total": len(data_list),
+        "format_errors": 0,
+        "TP": 0, "TN": 0, "FP": 0, "FN": 0,
+        "dim_match_count": 0,
+        "tp_count_for_dim": 0,
+        "score_mae": {"内容准确率": [], "规模及影响": [], "潜力及传承": []}
+    }
+
+    for item in data_list:
+        eval_res = evaluate_single_sample(item.get('ground_truth'), item.get('model_output'))
+
+        if eval_res["format_error"]:
+            stats["format_errors"] += 1
+            continue  # 格式错误不参与后续逻辑混淆矩阵计算
+
+        cls = eval_res["classification"]
+        stats[cls] += 1
+
+        if cls == "TP":
+            stats["tp_count_for_dim"] += 1
+            if eval_res["dim_match"]:
+                stats["dim_match_count"] += 1
+
+            for k, delta in eval_res["score_deltas"].items():
+                if k in stats["score_mae"]:
+                    stats["score_mae"][k].append(abs(delta))
+
+    return stats
+
+
+# --- 2. Helper Functions (File IO) ---
+def load_data():
+    data = []
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    data.append(json.loads(line))
+    return data
+
+
+def save_progress(index, label, comment, current_data):
+    current_data[index]['human_label'] = label
+    current_data[index]['comments'] = comment
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        for entry in current_data:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+# --- 3. UI 渲染函数 ---
+
+def render_metrics_sidebar(data):
+    st.sidebar.title("📊 Auto Evaluation Stats")
+
+    if not data:
+        st.sidebar.warning("No Data Loaded")
+        return
+
+    stats = calculate_global_metrics(data)
+    total_valid = stats["TP"] + stats["TN"] + stats["FP"] + stats["FN"]
+
+    # 1. 格式错误率
+    err_rate = (stats["format_errors"] / stats["total"]) * 100 if stats["total"] > 0 else 0
+    st.sidebar.metric("JSON Format Error Rate", f"{err_rate:.1f}%", help="无法解析JSON或缺少UUID的比例")
+
+    st.sidebar.divider()
+
+    # 2. 混淆矩阵指标
+    # Precision = TP / (TP + FP)
+    precision = stats["TP"] / (stats["TP"] + stats["FP"]) if (stats["TP"] + stats["FP"]) > 0 else 0
+    # Recall = TP / (TP + FN)
+    recall = stats["TP"] / (stats["TP"] + stats["FN"]) if (stats["TP"] + stats["FN"]) > 0 else 0
+    # Accuracy = (TP + TN) / Total Valid
+    acc = (stats["TP"] + stats["TN"]) / total_valid if total_valid > 0 else 0
+
+    c1, c2 = st.sidebar.columns(2)
+    c1.metric("Precision", f"{precision:.2%}")
+    c2.metric("Recall", f"{recall:.2%}")
+    st.sidebar.metric("Classification Acc", f"{acc:.2%}", help="正确判断 '有价值' vs '无价值' 的准确率")
+
+    st.sidebar.text(f"TP:{stats['TP']} | TN:{stats['TN']} | FP:{stats['FP']} | FN:{stats['FN']}")
+
+    st.sidebar.divider()
+
+    # 3. 维度与评分
+    dim_acc = stats["dim_match_count"] / stats["tp_count_for_dim"] if stats["tp_count_for_dim"] > 0 else 0
+    st.sidebar.metric("Primary Dimension Match", f"{dim_acc:.1f}%", help="在双方都认为有价值时，主要分类维度的一致性")
+
+    st.sidebar.write("Score MAE (平均绝对误差):")
+    for k, v_list in stats["score_mae"].items():
+        avg_mae = sum(v_list) / len(v_list) if v_list else 0
+        st.sidebar.caption(f"{k}: {avg_mae:.2f}")
+
+
+def render_content_card(column, title, raw_data, style="default", compare_eval=None, is_gt=False):
+    """
+    Enhanced render function based on evaluation results.
+    """
     data_dict = safe_parse_json(raw_data)
 
     with column:
-        st.markdown(f"### {title}")
+        # 标题行
+        header_cols = st.columns([3, 1])
+        header_cols[0].markdown(f"### {title}")
 
-        # =================================================
-        # 【核心修改】 如果解析失败 (data_dict 为 None)
-        # =================================================
+        # 如果是模型输出且有错误，显示在这里
+        if not is_gt and compare_eval:
+            if compare_eval["format_error"]:
+                header_cols[1].error("FORMAT ERR")
+            elif compare_eval["classification"] == "FN":
+                header_cols[1].error("MISSED (FN)")
+            elif compare_eval["classification"] == "FP":
+                header_cols[1].warning("NOISE (FP)")
+            elif compare_eval["classification"] == "TN":
+                header_cols[1].info("IGNORE (TN)")
+
         if data_dict is None:
-            st.error("⚠️ JSON Parse Error (格式错误)")
+            st.error("⚠️ JSON Parse Error")
+            st.code(str(raw_data), language="text")
+            return
 
-            # 这种情况下，直接把 raw_data 作为普通文本展示出来
-            # 使用 st.code 可以保留格式（换行符等），方便 debug
-            st.caption("原始输出 (Raw Output):")
-            st.code(str(raw_data), language="text", line_numbers=True)
+        # 判断是否为负例 (仅 UUID)
+        is_neg = is_negative_sample(data_dict)
 
-            # 可以在这里结束，也可以继续显示下面的完整查看器
-            # return
-
-        # =================================================
-        #  如果解析成功，显示漂亮的指标
-        # =================================================
+        if is_neg:
+            st.info(f"🚫 Negative Sample (No Value)\nUUID: {data_dict.get('UUID', 'Unknown')}")
         else:
-            # 1. 提取指标
-            primary_cat, primary_score = "N/A", 0
-            impact_score = 0
-            accuracy_score = 0
+            # 正常内容展示
+            indep_scores, (prim_cat, prim_score) = extract_scores(data_dict.get("RATE", {}))
 
-            if "RATE" in data_dict:
-                primary_cat, primary_score = extract_primary_category(data_dict["RATE"])
-                impact_score = data_dict["RATE"].get("规模及影响", 0)
-                accuracy_score = data_dict["RATE"].get("内容准确率", 0)
+            # 颜色逻辑：如果维度不匹配，且当前是模型输出，且不是GT，显示醒目颜色
+            cat_delta = None
+            if not is_gt and compare_eval and compare_eval["classification"] == "TP":
+                if not compare_eval["dim_match"]:
+                    cat_delta = "MISMATCH"
 
-            # 2. 显示三列指标
-            m1, m2, m3 = st.columns(3)
-            m1.metric(label="主要领域", value=primary_cat, delta=f"{primary_score}分")
-            m2.metric(label="规模影响", value=impact_score)
-            m3.metric(label="内容准确", value=accuracy_score)
+            # 指标展示
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric(label="主要维度", value=prim_cat, delta=cat_delta, delta_color="inverse")
+            m2.metric(label="主分", value=prim_score)
+            m3.metric(label="规模影响", value=indep_scores.get("规模及影响", 0))
+            m4.metric(label="内容准确", value=indep_scores.get("内容准确率", 0))
+
             st.divider()
 
-            # 3. 显示摘要文本
             display_text = data_dict.get("EVENT_TEXT", str(raw_data))
             if style == "success":
                 st.success(display_text)
@@ -158,90 +311,102 @@ def render_content_card(column, title, raw_data, style="default"):
             else:
                 st.info(display_text)
 
-        # =================================================
-        #  底部：无论成功失败，都提供折叠框查看原始数据
-        # =================================================
-        with st.expander("查看原始数据 (Source)"):
-            if data_dict:
-                st.json(data_dict)
-            else:
-                # 解析失败时，这里再次显示 raw_data，防止上面没看清
-                st.text(str(raw_data))
+        with st.expander("查看原始 JSON"):
+            st.json(data_dict)
 
 
 # --- Main App Logic ---
 def main():
-    st.title("🤖 LLM Fine-tuning Human Reviewer")
+    st.title("🤖 LLM Evaluation: Auto-Metrics & Human Review")
 
-    # 1. 初始化 Session State
+    # 1. 初始化
     if 'data' not in st.session_state:
         st.session_state.data = load_data()
 
     if 'current_index' not in st.session_state:
-        # 找到第一个还没评审的数据 (human_label is None)
         unreviewed_indices = [i for i, d in enumerate(st.session_state.data) if d.get('human_label') is None]
         st.session_state.current_index = unreviewed_indices[0] if unreviewed_indices else 0
 
     data = st.session_state.data
-    idx = st.session_state.current_index
 
-    # 进度条
-    reviewed_count = sum(1 for d in data if d.get('human_label') is not None)
+    # --- 渲染侧边栏统计 ---
+    render_metrics_sidebar(data)
+
+    # --- 主界面 ---
+    idx = st.session_state.current_index
     total_count = len(data)
+
+    # 顶部进度
+    reviewed_count = sum(1 for d in data if d.get('human_label') is not None)
     st.progress(reviewed_count / total_count if total_count > 0 else 0)
-    st.caption(f"Progress: {reviewed_count}/{total_count}")
 
     if idx < total_count:
         item = data[idx]
 
-        # --- 界面布局 ---
-        st.subheader(f"Sample #{idx + 1}")
+        # 实时计算当前条目的自动评估结果
+        eval_result = evaluate_single_sample(item.get('ground_truth'), item.get('model_output'))
 
-        # 对比区 (左右两栏)
+        st.subheader(f"Sample #{idx + 1} | Auto-Eval: {eval_result['classification']}")
+
+        # 对比区
         col1, col2 = st.columns(2)
 
+        # Ground Truth
         render_content_card(
             column=col1,
             title="✅ Ground Truth",
             raw_data=item.get('ground_truth', '{}'),
-            style="success"
+            style="success",
+            is_gt=True
         )
 
-        # 右边：Model Output
+        # Model Output
         render_content_card(
             column=col2,
             title="🤖 Model Output",
             raw_data=item.get('model_output', '{}'),
-            style="warning"
+            style="warning",
+            compare_eval=eval_result,  # 传入评估结果用于高亮差异
+            is_gt=False
         )
+
+        # --- 详细对比信息 (如果出错或不一致) ---
+        if eval_result["format_error"]:
+            st.error(f"❌ Critical Error: Model output format is invalid or missing UUID.")
+        elif eval_result["classification"] == "TP" and not eval_result["dim_match"]:
+            st.warning(
+                f"⚠️ Dimension Mismatch: GT implies '{eval_result['gt_primary']}' but Model predicts '{eval_result['pred_primary']}'")
+        elif eval_result["classification"] == "FN":
+            st.error("⚠️ Recall Failure: Ground truth has valid info, model returned Negative.")
+        elif eval_result["classification"] == "FP":
+            st.warning("⚠️ Precision Failure: Ground truth is Negative, model hallucinated info.")
 
         # --- 操作区 ---
         st.divider()
         c1, c2, c3 = st.columns([1, 1, 4])
 
         with c1:
-            if st.button("👍 Good / Pass", use_container_width=True, type="primary"):
+            if st.button("👍 Pass / Good", use_container_width=True, type="primary"):
                 save_progress(idx, "pass", "", data)
                 st.session_state.current_index += 1
                 st.rerun()
 
         with c2:
-            if st.button("👎 Bad / Fail", use_container_width=True):
+            if st.button("👎 Fail / Bad", use_container_width=True):
                 save_progress(idx, "fail", "", data)
                 st.session_state.current_index += 1
                 st.rerun()
 
         with c3:
-            # 允许写备注
-            comment = st.text_input("Optional Comments (e.g. 'Hallucination', 'Wrong Score')", key="comment_input")
-            if st.button("Submit with Comment"):
+            comment = st.text_input("Comments", key="comment_input", placeholder="e.g. Logic error, Wrong score...")
+            if st.button("Submit Comment"):
                 save_progress(idx, "commented", comment, data)
                 st.session_state.current_index += 1
                 st.rerun()
 
-        # 导航按钮
+        # 导航
         st.divider()
-        prev, _, next_btn = st.columns([1, 8, 1])
+        prev, center, next_btn = st.columns([1, 8, 1])
         if prev.button("Previous"):
             st.session_state.current_index = max(0, idx - 1)
             st.rerun()
@@ -249,37 +414,17 @@ def main():
             st.session_state.current_index = min(len(data) - 1, idx + 1)
             st.rerun()
 
-        # 输入展示区 (折叠以节省空间)
-        with st.expander("Input Prompt / Instruction", expanded=True):
-            st.info(f"**Instruction:** {item['instruction']}")
-            st.text(f"**Input:** {item['input']}")
+        with st.expander("Show Instruction & Input"):
+            st.info(f"**Instruction:** {item.get('instruction', '')}")
+            st.text(f"**Input:** {item.get('input', '')}")
 
     else:
         st.balloons()
-        st.success("🎉 All samples reviewed! You can calculate the accuracy now.")
+        st.success("🎉 All samples reviewed!")
 
-        # --- 修复 KeyError 的部分 ---
-        if data:
-            df = pd.DataFrame(data)
-
-            # 1. 安全检查：确保列存在
-            if 'human_label' in df.columns:
-                st.write("### Label Distribution")
-                # 统计各标签数量
-                counts = df['human_label'].value_counts()
-                st.write(counts)
-
-                # 可选：简单的可视化
-                st.bar_chart(counts)
-            else:
-                st.info("No labels found yet (all items are unreviewed or missing 'human_label' field).")
-        else:
-            st.warning("No data loaded.")
-        # ---------------------------
-
-        # 下载最终结果
+        # 最终下载
         st.download_button(
-            label="Download Reviewed JSONL",
+            label="Download Reviewed Data",
             data=json.dumps(data, indent=2, ensure_ascii=False),
             file_name="reviewed_final.json",
             mime="application/json"

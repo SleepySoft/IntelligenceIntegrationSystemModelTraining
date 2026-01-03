@@ -12,17 +12,17 @@ from peft import PeftModel
 export HIP_VISIBLE_DEVICES=0
 
 python validation1_batch_inference.py \
-    --adapter ./saves/qwen2.5-7b-intelligence/lora/sft_ddp_fp32/checkpoint-100 \
-    --data data/alpaca_test.json \
-    --output result_ckpt100.jsonl
+    --adapter ~/Depot/ModelTrain/LLaMA-Factory/saves/qwen2.5-7b-intelligence/lora/sft_ddp_fp32/checkpoint-360 \
+    --data ~/Depot/ModelTrain/LLaMA-Factory/data/alpaca_test.json \
+    --output result_ckpt360.jsonl
 
 # 指定使用 GPU 1
 export HIP_VISIBLE_DEVICES=1
 
 python validation1_batch_inference.py \
-    --adapter ./saves/qwen2.5-7b-intelligence/lora/sft_ddp_fp32/checkpoint-150 \
-    --data data/alpaca_test.json \
-    --output result_ckpt150.jsonl
+    --adapter ~/Depot/ModelTrain/LLaMA-Factory/saves/qwen2.5-7b-intelligence/lora/sft_ddp_fp32/checkpoint-240 \
+    --data ~/Depot/ModelTrain/LLaMA-Factory/data/alpaca_test.json \
+    --output result_ckpt240.jsonl
 """
 
 
